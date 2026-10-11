@@ -1,0 +1,373 @@
+"""
+GlassBox Server — FastAPI app with WebSocket streaming + static UI mount.
+Run with: glassbox serve (or uvicorn glassbox.server.app:app)
+Made with 🔮 by Karan Ray
+"""
+import json
+import os
+import time
+from pathlib import Path
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+from contextlib import asynccontextmanager
+
+from glassbox.model import Transformer
+from glassbox.tokenizer import Tokenizer
+from glassbox.generate import generate_stream
+from glassbox.trace_payload import build_step_payload
+from glassbox.gemini_client import (
+    explain_trace,
+    diagnose_prompt,
+    gemma_generate,
+    GeminiError,
+    GeminiKeyMissing,
+    GeminiRateLimited,
+)
+
+# ─── Load .env if present ───────────────────────────────────────
+_env_path = Path(__file__).parent.parent.parent / ".env"
+if _env_path.exists():
+    for line in _env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip())
+
+
+# ─── Global Model Instance ──────────────────────────────────────
+STATE = {
+    "model": None,
+    "tokenizer": None,
+    "model_dir": None,
+}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load model once on server startup if available."""
+    print("🔮 GlassBox Server starting...")
+    models_root = Path(__file__).parent.parent.parent / "models"
+    # Check both common directory names
+    model_dir = models_root / "SmolLM2-135M-Instruct"
+    if not model_dir.exists():
+        model_dir = models_root / "SmolLM2-135M"
+
+    STATE["model_dir"] = model_dir
+    has_weights = model_dir.exists() and any(model_dir.glob("*.safetensors"))
+    if has_weights:
+        try:
+            print(f"📦 Loading model from {model_dir}...")
+            STATE["tokenizer"] = Tokenizer(model_dir)
+            STATE["model"] = Transformer(model_dir)
+            print("✅ Model loaded! Local engine ready at http://localhost:8000")
+        except Exception as e:
+            print(f"⚠️ Could not load local model: {e}")
+    else:
+        print("ℹ️ Local model weights not found at models/. Run 'python download_model.py' to download.")
+        print("✨ Gemma 4 interpretability features are active via Gemini API.")
+    yield
+    print("👋 Server shutting down.")
+
+
+app = FastAPI(title="GlassBox 🔮", lifespan=lifespan)
+
+
+# ─── WebSocket: Generation Stream ──────────────────────────────
+@app.websocket("/ws/generate")
+async def ws_generate(ws: WebSocket):
+    await ws.accept()
+    try:
+        # Receive generation params from client
+        params = await ws.receive_json()
+        prompt = params.get("prompt", "The quick brown fox jumps over the lazy dog.")
+        max_new_tokens = int(params.get("max_new_tokens", 30))
+        temperature = float(params.get("temperature", 0.7))
+        top_k = int(params.get("top_k", 40))
+        top_p = float(params.get("top_p", 0.9))
+        use_cache = bool(params.get("use_cache", True))
+        trace = bool(params.get("trace", True))
+        engine_type = params.get("engine", "glassbox")
+
+        image_b64 = params.get("image_b64")
+        image_bytes = None
+        if image_b64:
+            import base64
+            if "," in image_b64:
+                image_b64 = image_b64.split(",", 1)[1]
+            image_bytes = base64.b64decode(image_b64)
+
+        if engine_type in ("hf", "huggingface", "gemma"):
+            try:
+                from gemma_engine.loader import load_model
+                from gemma_engine.engine import GlassBoxEngine
+            except ImportError:
+                await ws.send_json({"type": "error", "message": "HuggingFace engine not installed. Run: pip install torch transformers accelerate"})
+                return
+
+            hf_loader = load_model()
+            hf_engine = GlassBoxEngine(hf_loader)
+
+            await ws.send_json({
+                "type": "init",
+                "config": {
+                    "model_id": hf_loader.model_id,
+                    "num_layers": hf_loader.config.num_hidden_layers,
+                    "num_heads": getattr(hf_loader.config, "num_attention_heads", 0),
+                    "num_kv_heads": getattr(hf_loader.config, "num_key_value_heads", 0),
+                    "hidden_size": hf_loader.config.hidden_size,
+                    "vocab_size": hf_loader.config.vocab_size,
+                },
+                "prompt": prompt,
+                "prompt_token_strs": [],
+            })
+
+            step_idx = 0
+            for step in hf_engine.chat(
+                user_message=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k_trace=top_k,
+                greedy=(temperature == 0.0),
+                image_bytes=image_bytes,
+            ):
+                payload = {
+                    "type": "step",
+                    "step": step_idx,
+                    "token_id": step.token_id,
+                    "token_str": step.token_str,
+                    "tokens_per_sec": step.tokens_per_sec,
+                    "cache_active": True,
+                    "entropy_bits": step.entropy_bits,
+                    "top_logit_ids": [c.token_id for c in step.top_k_candidates],
+                    "top_logit_values": [c.prob for c in step.top_k_candidates],
+                    "top_logit_strs": [c.token_str for c in step.top_k_candidates],
+                    "attention_new_rows": step.attention_per_head if trace else None,
+                    "lens_predictions": [
+                        {"layer": l.layer, "token_str": l.token_str, "prob": l.prob, "is_sliding_window": getattr(l, "is_sliding_window", False)}
+                        for l in step.lens
+                    ] if trace else None
+                }
+                await ws.send_json(payload)
+                step_idx += 1
+
+            await ws.send_json({"type": "done", "total_steps": step_idx})
+            return
+
+        # --- Default GlassBox Engine ---
+        model = STATE["model"]
+        tok = STATE["tokenizer"]
+
+        # Wrap in SmolLM2-Instruct chat template so the model answers questions
+        # instead of doing raw text completion.
+        SYSTEM = "You are a helpful AI assistant. Answer questions clearly and concisely."
+        formatted_prompt = (
+            f"<|im_start|>system\n{SYSTEM}<|im_end|>\n"
+            f"<|im_start|>user\n{prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+        # Send initial metadata (show the original user prompt to UI, not the template)
+        await ws.send_json({
+            "type": "init",
+            "config": {
+                "num_layers": model.config.num_hidden_layers,
+                "num_heads": model.config.num_attention_heads,
+                "num_kv_heads": model.config.num_key_value_heads,
+                "hidden_size": model.config.hidden_size,
+                "vocab_size": model.config.vocab_size,
+            },
+            "prompt": prompt,
+            "prompt_token_strs": [tok.decode(t) for t in tok.encode(prompt)],
+        })
+
+        # Stream generation using the formatted prompt
+        # stop on <|im_end|> (token 2) to prevent looping
+        step_idx = 0
+        for step in generate_stream(
+            model=model,
+            tokenizer=tok,
+            prompt=formatted_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            use_cache=use_cache,
+            trace=trace,
+            stop_token_ids={2},  # <|im_end|> stops the assistant turn
+        ):
+            payload = build_step_payload(
+                step_idx=step_idx,
+                token_id=step.token_id,
+                token_str=step.token_str,
+                tokens_per_sec=step.tokens_per_sec,
+                cache_active=step.is_cache_active,
+                logits=step.output_logits,
+                traces=step.traces,
+                tokenizer=tok,
+                model=model,
+                top_n=200,
+                include_attention=trace,
+                include_lens=trace,
+            )
+            payload["type"] = "step"
+            await ws.send_json(payload)
+            step_idx += 1
+
+        await ws.send_json({"type": "done", "total_steps": step_idx})
+
+    except WebSocketDisconnect:
+        print("Client disconnected.")
+    except Exception as e:
+        print(f"❌ Error during generation: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await ws.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+
+
+# ─── Gemma 4 API: Explain Trace ────────────────────────────────
+@app.post("/api/explain")
+async def api_explain(request: Request):
+    """Analyze a generation trace with Gemma 4 (multimodal).
+
+    Body JSON:
+      prompt: str
+      generated_tokens: [{step, token_str, token_id}, ...]
+      top_k_per_step: [[{token_str, prob}, ...], ...]
+      entropy_per_step: [float, ...]
+      heatmap_b64_png: str | null  (base64 PNG of attention canvas)
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    try:
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: explain_trace(
+                prompt=body.get("prompt", ""),
+                generated_tokens=body.get("generated_tokens", []),
+                top_k_per_step=body.get("top_k_per_step", []),
+                entropy_per_step=body.get("entropy_per_step", []),
+                heatmap_b64_png=body.get("heatmap_b64_png"),
+            ),
+        )
+        return JSONResponse(result)
+    except GeminiKeyMissing as exc:
+        return JSONResponse({"error": str(exc), "error_type": "missing_key"}, status_code=503)
+    except GeminiRateLimited as exc:
+        return JSONResponse({"error": str(exc), "error_type": "rate_limit"}, status_code=429)
+    except GeminiError as exc:
+        return JSONResponse({"error": str(exc), "error_type": "api_error"}, status_code=502)
+    except Exception as exc:
+        return JSONResponse({"error": f"Unexpected error: {exc}", "error_type": "internal"}, status_code=500)
+
+
+# ─── Gemma 4 API: Diagnose Prompt ──────────────────────────────
+@app.post("/api/diagnose")
+async def api_diagnose(request: Request):
+    """Diagnose prompt issues and suggest improvements using Gemma 4.
+
+    Body JSON:
+      prompt: str
+      generated_tokens: [{step, token_str, token_id}, ...]
+      entropy_per_step: [float, ...]
+      top_k_per_step: [[{token_str, prob}, ...], ...]
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    try:
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: diagnose_prompt(
+                prompt=body.get("prompt", ""),
+                generated_tokens=body.get("generated_tokens", []),
+                entropy_per_step=body.get("entropy_per_step", []),
+                top_k_per_step=body.get("top_k_per_step", []),
+            ),
+        )
+        return JSONResponse(result)
+    except GeminiKeyMissing as exc:
+        return JSONResponse({"error": str(exc), "error_type": "missing_key"}, status_code=503)
+    except GeminiRateLimited as exc:
+        return JSONResponse({"error": str(exc), "error_type": "rate_limit"}, status_code=429)
+    except GeminiError as exc:
+        return JSONResponse({"error": str(exc), "error_type": "api_error"}, status_code=502)
+    except Exception as exc:
+
+# ─── Gemma 4 API: Compare Models ───────────────────────────────
+@app.post("/api/compare")
+async def api_compare(request: Request):
+    """Generate completion via Gemma 4 for side-by-side model comparison.
+
+    Body JSON:
+      prompt: str
+      temperature: float = 0.7
+      max_tokens: int = 60
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    prompt = body.get("prompt", "")
+    temperature = float(body.get("temperature", 0.7))
+    max_tokens = int(body.get("max_tokens", 60))
+
+    try:
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: gemma_generate(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            ),
+        )
+        return JSONResponse(result)
+    except GeminiKeyMissing as exc:
+        return JSONResponse({"error": str(exc), "error_type": "missing_key"}, status_code=503)
+    except GeminiRateLimited as exc:
+        return JSONResponse({"error": str(exc), "error_type": "rate_limit"}, status_code=429)
+    except GeminiError as exc:
+        return JSONResponse({"error": str(exc), "error_type": "api_error"}, status_code=502)
+    except Exception as exc:
+        return JSONResponse({"error": f"Unexpected error: {exc}", "error_type": "internal"}, status_code=500)
+
+
+# ─── Static Files: Serve the UI ────────────────────────────────
+WEB_DIR = Path(__file__).parent.parent / "web"
+
+@app.get("/")
+async def root():
+    return FileResponse(WEB_DIR / "index.html")
+
+# Mount everything else as static
+app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+
+
+# ─── Health Check ──────────────────────────────────────────────
+@app.get("/health")
+@app.get("/api/health")
+async def health():
+    from gemma_engine.loader import _singleton as hf_singleton
+    hf_loaded = hf_singleton is not None and hf_singleton.loaded
+    model_id = hf_singleton.model_id if hf_loaded else None
+    return {
+        "status": "ok",
+        "model_loaded": STATE["model"] is not None or hf_loaded,
+        "glassbox_engine": STATE["model"] is not None,
+        "hf_engine": hf_loaded,
+        "hf_model_id": model_id,
+    }
